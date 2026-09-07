@@ -48,11 +48,13 @@ jobs:
         run: |
           set -euxo pipefail
           export PATH="$HOME/.local/bin:$PATH"
+
           uv pip install --python /opt/t4build/bin/python \
             --index-url https://download.pytorch.org/whl/cu126 \
             torch==2.6.0
+
           uv pip install --python /opt/t4build/bin/python \
-            pip setuptools wheel packaging ninja cmake
+            pip setuptools wheel packaging ninja cmake numpy
 
       - name: Clone GGUF CUDA kernel source
         shell: bash
@@ -60,6 +62,102 @@ jobs:
           set -euxo pipefail
           git clone --depth 1 https://github.com/deepbeepmeep/kernels.git /work/kernels
           test -d /work/kernels/llama.cpp
+
+      - name: Record source revision
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /work/artifact
+          cd /work/kernels
+          git rev-parse HEAD | tee /work/artifact/upstream_commit.txt
+          git status --short | tee /work/artifact/upstream_status_before_patch.txt
+
+      - name: Patch Python 3.12 metadata gate only
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd /work/kernels/llama.cpp
+
+          /opt/t4build/bin/python - <<'PY'
+          from pathlib import Path
+          import re, json, sys
+
+          candidates = [
+              Path("pyproject.toml"),
+              Path("setup.cfg"),
+              Path("setup.py"),
+          ]
+
+          changed = []
+          records = []
+
+          patterns = [
+              (r'>=3\.10,<3\.12', '>=3.10,<3.13'),
+              (r'>=3\.10,\s*<3\.12', '>=3.10,<3.13'),
+              (r'<3\.12,\s*>=3\.10', '<3.13,>=3.10'),
+              (r'<3\.12', '<3.13'),
+          ]
+
+          for path in candidates:
+              if not path.exists():
+                  continue
+              original = path.read_text(encoding="utf-8")
+              patched = original
+              local_changes = []
+              for pat, repl in patterns:
+                  new = re.sub(pat, repl, patched)
+                  if new != patched:
+                      local_changes.append({"pattern": pat, "replacement": repl})
+                      patched = new
+              if patched != original:
+                  backup = path.with_suffix(path.suffix + ".before_py312_patch")
+                  backup.write_text(original, encoding="utf-8")
+                  path.write_text(patched, encoding="utf-8")
+                  changed.append(str(path))
+                  records.append({
+                      "file": str(path),
+                      "backup": str(backup),
+                      "changes": local_changes,
+                  })
+
+          if not changed:
+              raise SystemExit(
+                  "Did not find the Python <3.12 metadata gate in pyproject.toml/setup.cfg/setup.py."
+              )
+
+          Path("/work/artifact/python312_metadata_patch.json").write_text(
+              json.dumps({
+                  "purpose": "Allow CPython 3.12 metadata evaluation only; no native source code patched.",
+                  "changed_files": changed,
+                  "records": records,
+              }, indent=2),
+              encoding="utf-8",
+          )
+
+          print("Patched metadata files:", changed)
+          PY
+
+          echo "----- git diff after metadata patch -----"
+          git diff -- . | tee /work/artifact/python312_metadata_patch.diff
+
+      - name: Validate target environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          /opt/t4build/bin/python - <<'PY'
+          import sys, torch, numpy
+          print("Python:", sys.version)
+          print("Torch:", torch.__version__)
+          print("Torch CUDA:", torch.version.cuda)
+          print("NumPy:", numpy.__version__)
+
+          assert sys.version_info[:2] == (3, 12)
+          assert torch.__version__.startswith("2.6.0")
+          assert torch.version.cuda == "12.6"
+          PY
+
+          nvcc --version | tee /work/artifact/nvcc_version.txt
 
       - name: Build Linux T4 SM75 wheel
         shell: bash
@@ -71,33 +169,71 @@ jobs:
           mkdir -p /work/dist
           cd /work/kernels/llama.cpp
 
-          /opt/t4build/bin/python - <<'PY'
-          import sys, torch
-          print("Python:", sys.version)
-          print("Torch:", torch.__version__)
-          print("Torch CUDA:", torch.version.cuda)
-          assert sys.version_info[:2] == (3, 12)
-          assert torch.__version__.startswith("2.6.0")
-          assert torch.version.cuda == "12.6"
-          PY
-
-          nvcc --version
-
+          # Use the package's documented wheel build path.
+          # UV prepared the environment; pip performs the actual wheel build.
           /opt/t4build/bin/python -m pip wheel . \
             --no-build-isolation \
             --no-deps \
-            -w /work/dist
+            -w /work/dist 2>&1 | tee /work/artifact/build.log
 
           ls -lh /work/dist
           test "$(find /work/dist -maxdepth 1 -name 'llamacpp_gguf_cuda*.whl' | wc -l)" -ge 1
 
-      - name: Create manifests and checksums
+      - name: Inspect built wheel
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p /work/artifact
 
-          cp /work/dist/llamacpp_gguf_cuda*.whl /work/artifact/
+          WHEEL="$(find /work/dist -maxdepth 1 -name 'llamacpp_gguf_cuda*.whl' | head -n 1)"
+          test -n "$WHEEL"
+          cp "$WHEEL" /work/artifact/
+
+          /opt/t4build/bin/python -m zipfile -l "$WHEEL" \
+            > /work/artifact/wheel_contents.txt
+
+          /opt/t4build/bin/python - <<'PY' "$WHEEL"
+          import sys, zipfile, re, pathlib
+          wheel = pathlib.Path(sys.argv[1])
+          with zipfile.ZipFile(wheel) as z:
+              metadata = [n for n in z.namelist() if n.endswith(".dist-info/METADATA")]
+              if not metadata:
+                  raise SystemExit("Wheel METADATA not found")
+              text = z.read(metadata[0]).decode("utf-8", "replace")
+          for line in text.splitlines():
+              if line.startswith(("Name:", "Version:", "Requires-Python:")):
+                  print(line)
+          pathlib.Path("/work/artifact/wheel_metadata_summary.txt").write_text(
+              "\n".join(
+                  line for line in text.splitlines()
+                  if line.startswith(("Name:", "Version:", "Requires-Python:"))
+              ) + "\n",
+              encoding="utf-8"
+          )
+          PY
+
+          sha256sum /work/artifact/*.whl | tee /work/artifact/SHA256SUMS.txt
+
+      - name: Test wheel install and CPU-side import
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          WHEEL="$(find /work/dist -maxdepth 1 -name 'llamacpp_gguf_cuda*.whl' | head -n 1)"
+          uv pip install --python /opt/t4build/bin/python \
+            --no-deps --reinstall "$WHEEL"
+
+          /opt/t4build/bin/python - <<'PY' 2>&1 | tee /work/artifact/import_test.log
+          import sys
+          import llamacpp_gguf_cuda
+          print("Python:", sys.version)
+          print("llamacpp_gguf_cuda:", llamacpp_gguf_cuda.__file__)
+          print("CPU-side import PASS")
+          PY
+
+      - name: Create build environment manifest
+        shell: bash
+        run: |
+          set -euxo pipefail
 
           /opt/t4build/bin/python - <<'PY' > /work/artifact/build_environment.txt
           import sys, torch, platform
@@ -107,9 +243,6 @@ jobs:
           print("torch_cuda =", torch.version.cuda)
           PY
 
-          nvcc --version > /work/artifact/nvcc_version.txt
-          sha256sum /work/artifact/*.whl > /work/artifact/SHA256SUMS.txt
-
           cat > /work/artifact/README.txt <<'TXT'
           MiniMax-H3 Kaggle T4 GGUF CUDA Wheel
           ====================================
@@ -118,34 +251,54 @@ jobs:
           - Linux x86_64
           - CPython 3.12
           - PyTorch 2.6.0 + CUDA 12.6
-          - Tesla T4 / SM75 (TORCH_CUDA_ARCH_LIST=7.5)
+          - Tesla T4 / SM75
+          - TORCH_CUDA_ARCH_LIST=7.5
 
-          Install on Kaggle:
-            uv pip install --target /kaggle/working/minimax_h3_t4_stack \
-              --no-deps --reinstall ./llamacpp_gguf_cuda-*.whl
+          Important:
+          The current upstream package metadata declares Python <3.12.
+          This workflow patches ONLY that metadata gate to allow Python 3.12.
+          It does not intentionally modify CUDA/C++/Python runtime source code.
 
-          This wheel is intended to remove the native GGUF CUDA compile step
-          from future MiniMax-H3 Kaggle T4 sessions.
+          The exact upstream Git commit and patch diff are included:
+          - upstream_commit.txt
+          - python312_metadata_patch.diff
+          - python312_metadata_patch.json
+
+          The wheel is then built using:
+            python -m pip wheel . --no-build-isolation --no-deps
+
+          UV is used only to prepare/install the environment and finished wheel.
+
+          A GitHub-hosted CPU runner cannot verify execution on a real Tesla T4.
+          Final SM75 runtime verification must happen once on Kaggle/T4 or another T4.
           TXT
 
-      - name: Upload wheel artifact
+      - name: Upload wheel and logs artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: MiniMax-H3-T4-GGUF-CUDA-Wheel
+          name: MiniMax-H3-T4-GGUF-CUDA-Build
           path: /work/artifact/*
           if-no-files-found: error
           compression-level: 0
 
       - name: Publish release asset
-        if: github.event_name == 'workflow_dispatch'
+        if: success() && github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euxo pipefail
-          TAG="minimax-h3-t4-gguf-cu126"
+
+          # gh is not guaranteed inside the CUDA container, so download a standalone gh package.
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y gh
+          rm -rf /var/lib/apt/lists/*
+
+          TAG="minimax-h3-t4-gguf-cu126-py312"
           gh release view "$TAG" >/dev/null 2>&1 || \
             gh release create "$TAG" \
-              --title "MiniMax-H3 T4 GGUF CUDA cu126" \
-              --notes "Linux CPython 3.12 / Torch 2.6.0+cu126 / Tesla T4 SM75 compiled GGUF CUDA wheel."
+              --title "MiniMax-H3 T4 GGUF CUDA cu126 py312" \
+              --notes "Linux CPython 3.12 / Torch 2.6.0+cu126 / Tesla T4 SM75 wheel. Upstream Python metadata gate patched from <3.12 to <3.13; patch record is included."
+
           gh release upload "$TAG" /work/artifact/* --clobber
