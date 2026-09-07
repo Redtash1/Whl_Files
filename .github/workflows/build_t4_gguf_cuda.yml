@@ -1,0 +1,151 @@
+name: Build MiniMax-H3 T4 GGUF CUDA Wheel
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build_t4_gguf_cuda.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    container:
+      image: nvidia/cuda:12.6.3-devel-ubuntu22.04
+
+    steps:
+      - name: Install base tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            curl ca-certificates git build-essential cmake ninja-build \
+            libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
+            libffi-dev liblzma-dev xz-utils tk-dev
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Install UV
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install Python 3.12 with UV
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          uv python install 3.12
+          uv venv --python 3.12 /opt/t4build
+
+      - name: Install Torch 2.6 cu126 build environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          uv pip install --python /opt/t4build/bin/python \
+            --index-url https://download.pytorch.org/whl/cu126 \
+            torch==2.6.0
+          uv pip install --python /opt/t4build/bin/python \
+            pip setuptools wheel packaging ninja cmake
+
+      - name: Clone GGUF CUDA kernel source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/deepbeepmeep/kernels.git /work/kernels
+          test -d /work/kernels/llama.cpp
+
+      - name: Build Linux T4 SM75 wheel
+        shell: bash
+        env:
+          TORCH_CUDA_ARCH_LIST: "7.5"
+          MAX_JOBS: "2"
+        run: |
+          set -euxo pipefail
+          mkdir -p /work/dist
+          cd /work/kernels/llama.cpp
+
+          /opt/t4build/bin/python - <<'PY'
+          import sys, torch
+          print("Python:", sys.version)
+          print("Torch:", torch.__version__)
+          print("Torch CUDA:", torch.version.cuda)
+          assert sys.version_info[:2] == (3, 12)
+          assert torch.__version__.startswith("2.6.0")
+          assert torch.version.cuda == "12.6"
+          PY
+
+          nvcc --version
+
+          /opt/t4build/bin/python -m pip wheel . \
+            --no-build-isolation \
+            --no-deps \
+            -w /work/dist
+
+          ls -lh /work/dist
+          test "$(find /work/dist -maxdepth 1 -name 'llamacpp_gguf_cuda*.whl' | wc -l)" -ge 1
+
+      - name: Create manifests and checksums
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /work/artifact
+
+          cp /work/dist/llamacpp_gguf_cuda*.whl /work/artifact/
+
+          /opt/t4build/bin/python - <<'PY' > /work/artifact/build_environment.txt
+          import sys, torch, platform
+          print("python =", sys.version)
+          print("platform =", platform.platform())
+          print("torch =", torch.__version__)
+          print("torch_cuda =", torch.version.cuda)
+          PY
+
+          nvcc --version > /work/artifact/nvcc_version.txt
+          sha256sum /work/artifact/*.whl > /work/artifact/SHA256SUMS.txt
+
+          cat > /work/artifact/README.txt <<'TXT'
+          MiniMax-H3 Kaggle T4 GGUF CUDA Wheel
+          ====================================
+
+          Target:
+          - Linux x86_64
+          - CPython 3.12
+          - PyTorch 2.6.0 + CUDA 12.6
+          - Tesla T4 / SM75 (TORCH_CUDA_ARCH_LIST=7.5)
+
+          Install on Kaggle:
+            uv pip install --target /kaggle/working/minimax_h3_t4_stack \
+              --no-deps --reinstall ./llamacpp_gguf_cuda-*.whl
+
+          This wheel is intended to remove the native GGUF CUDA compile step
+          from future MiniMax-H3 Kaggle T4 sessions.
+          TXT
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiniMax-H3-T4-GGUF-CUDA-Wheel
+          path: /work/artifact/*
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Publish release asset
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          TAG="minimax-h3-t4-gguf-cu126"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" \
+              --title "MiniMax-H3 T4 GGUF CUDA cu126" \
+              --notes "Linux CPython 3.12 / Torch 2.6.0+cu126 / Tesla T4 SM75 compiled GGUF CUDA wheel."
+          gh release upload "$TAG" /work/artifact/* --clobber
