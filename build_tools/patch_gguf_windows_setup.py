@@ -24,6 +24,29 @@ NEW_VC = r"""def _vc_tools_dir() -> str:
             return str(sorted(entries)[-1])
     raise FileNotFoundError("Could not locate Visual Studio 2022 MSVC tools under " + str(vs_root))
 """
+
+OLD_WIN_NVCC = (
+ 'if os.name == "nt":\n'
+ '    BASE_NVCC_FLAGS.extend(["-Xcompiler", "/Zc:preprocessor"])\n'
+)
+NEW_WIN_NVCC = (
+ 'if os.name == "nt":\n'
+ '    BASE_NVCC_FLAGS.extend(["-Xcompiler", "/Zc:preprocessor"])\n'
+ '    # Force VS/UCRT/Windows SDK include paths directly onto every nvcc command.\n'
+ '    _sdk_root, _sdk_version = _windows_sdk_dir()\n'
+ '    _nvcc_host_include_dirs = [\n'
+ '        os.path.join(_vc_tools_dir(), "include"),\n'
+ '        os.path.join(_sdk_root, "Include", _sdk_version, "ucrt"),\n'
+ '        os.path.join(_sdk_root, "Include", _sdk_version, "shared"),\n'
+ '        os.path.join(_sdk_root, "Include", _sdk_version, "um"),\n'
+ '        os.path.join(_sdk_root, "Include", _sdk_version, "winrt"),\n'
+ '        os.path.join(_sdk_root, "Include", _sdk_version, "cppwinrt"),\n'
+ '    ]\n'
+ '    for _inc in _nvcc_host_include_dirs:\n'
+ '        if os.path.isdir(_inc):\n'
+ '            BASE_NVCC_FLAGS.append("-I" + _inc)\n'
+)
+
 OLD_ENV = (
  'EXTRA_INCLUDE_DIRS = _env_path_list("LLAMACPP_GGUF_CUDA_INCLUDE_DIRS")\n'
  'EXTRA_LIBRARY_DIRS = _env_path_list("LLAMACPP_GGUF_CUDA_LIB_DIRS")\n'
@@ -60,6 +83,7 @@ def main():
     p=Path(sys.argv[1])
     text=p.read_text(encoding="utf-8")
     text=once(text,OLD_VC,NEW_VC,"MSVC")
+    text=once(text,OLD_WIN_NVCC,NEW_WIN_NVCC,"direct nvcc SDK/UCRT includes")
     text=once(text,OLD_ENV,NEW_ENV,"INCLUDE/LIB")
     text=once(text,OLD_ATTN,NEW_ATTN,"_attention")
     compile(text,str(p),"exec")
@@ -67,6 +91,8 @@ def main():
     check=p.read_text(encoding="utf-8")
     for marker in (
         'os.environ.get("VCToolsInstallDir"',
+        'BASE_NVCC_FLAGS.append("-I" + _inc)',
+        '_nvcc_host_include_dirs = [',
         'EXTRA_INCLUDE_DIRS += _env_path_list("INCLUDE")',
         'EXTRA_LIBRARY_DIRS += _env_path_list("LIB")',
         'include_dirs=EXTRA_INCLUDE_DIRS',
