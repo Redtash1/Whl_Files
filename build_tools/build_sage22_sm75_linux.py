@@ -188,57 +188,188 @@ def patch_sage22_setup(setup: Path):
 
 
 def patch_blkk32(src: Path):
-    candidates = []
-    for p in src.rglob("dispatch_utils.h"):
-        txt = p.read_text(encoding="utf-8", errors="replace")
-        if "csrc" in p.parts and "DISPATCH_BLOCK_SIZE" in txt:
-            candidates.append(p)
-    if not candidates:
-        raise RuntimeError("Sage2.2 dispatch_utils.h with DISPATCH_BLOCK_SIZE not found")
+    path = src / "csrc" / "dispatch_utils.h"
+    if not path.is_file():
+        raise RuntimeError(f"Expected Sage2.2 dispatch header missing: {path}")
 
-    path = candidates[0]
     text = path.read_text(encoding="utf-8")
+    macro_start = text.find("#define DISPATCH_BLOCK_SIZE(")
+    if macro_start < 0:
+        raise RuntimeError("DISPATCH_BLOCK_SIZE macro not found")
 
-    if re.search(r"block_size\s*==\s*32", text):
-        print("PATCH: BLOCK_SIZE=32 already present", path)
-        return
+    next_macro = text.find("#define ", macro_start + len("#define "))
+    macro_end = next_macro if next_macro >= 0 else len(text)
+    macro = text[macro_start:macro_end]
 
-    pat = re.compile(
-        r'(?P<i>[ \t]*)if \(block_size == 64\) \{\s*\\\n'
-        r'(?P=i)[ \t]*constexpr int BLOCK_SIZE = 64;\s*\\\n'
-        r'(?P=i)[ \t]*__VA_ARGS__\s*\\\n'
-        r'(?P=i)[ \t]*\} else if \(block_size == 128\) \{'
-    )
-    m = pat.search(text)
-    if not m:
-        pos = text.find("#define DISPATCH_BLOCK_SIZE")
-        preview = text[pos:pos + 700] if pos >= 0 else text[:700]
-        raise RuntimeError(
-            "Could not match official DISPATCH_BLOCK_SIZE macro.\n"
-            f"SOURCE PREVIEW:\n{preview}"
+    if "block_size == 32" not in macro:
+        err_pos = macro.find("Unsupported block_size")
+        if err_pos < 0:
+            raise RuntimeError("DISPATCH_BLOCK_SIZE unsupported fallback not found")
+
+        prefix = macro[:err_pos]
+        candidates = list(re.finditer(
+            r'(?m)^(?P<indent>[ \t]*)\}[ \t]+else[ \t]*\{[ \t]*\\[ \t]*$',
+            prefix,
+        ))
+        if not candidates:
+            raise RuntimeError(
+                "Could not locate DISPATCH_BLOCK_SIZE fallback else line"
+            )
+
+        fb = candidates[-1]
+        indent = fb.group("indent")
+        branch = (
+            f"{indent}}} else if (block_size == 32) {{                                \\\n"
+            f"{indent}  constexpr int BLOCK_SIZE = 32;                              \\\n"
+            f"{indent}  __VA_ARGS__                                                 \\\n"
         )
-
-    i = m.group("i")
-    replacement = (
-        f"{i}if (block_size == 32) {{                                       \\\n"
-        f"{i}  constexpr int BLOCK_SIZE = 32;                              \\\n"
-        f"{i}  __VA_ARGS__                                                 \\\n"
-        f"{i}}} else if (block_size == 64) {{                               \\\n"
-        f"{i}  constexpr int BLOCK_SIZE = 64;                              \\\n"
-        f"{i}  __VA_ARGS__                                                 \\\n"
-        f"{i}}} else if (block_size == 128) {{"
-    )
-    text = text[:m.start()] + replacement + text[m.end():]
-    path.write_text(text, encoding="utf-8")
+        macro = macro[:fb.start()] + branch + macro[fb.start():]
+        text = text[:macro_start] + macro + text[macro_end:]
+        path.write_text(text, encoding="utf-8")
 
     verify = path.read_text(encoding="utf-8")
-    for val in ("32", "64", "128"):
-        if not re.search(rf"block_size\s*==\s*{val}", verify):
-            raise RuntimeError(f"BLOCK_SIZE={val} branch missing after patch")
-        if not re.search(rf"BLOCK_SIZE\s*=\s*{val}", verify):
-            raise RuntimeError(f"BLOCK_SIZE={val} constexpr missing after patch")
-    print("PATCH: Sage2.2 fused dispatcher accepts BLOCK_SIZE=32")
+    vstart = verify.find("#define DISPATCH_BLOCK_SIZE(")
+    vnext = verify.find("#define ", vstart + len("#define "))
+    vmacro = verify[vstart:vnext if vnext >= 0 else len(verify)]
 
+    required = {
+        "branch32": "block_size == 32",
+        "constexpr32": "constexpr int BLOCK_SIZE = 32;",
+        "branch64": "block_size == 64",
+        "constexpr64": "constexpr int BLOCK_SIZE = 64;",
+        "branch128": "block_size == 128",
+        "constexpr128": "constexpr int BLOCK_SIZE = 128;",
+        "fallback": "Unsupported block_size",
+    }
+    missing = [name for name, token in required.items() if token not in vmacro]
+    if missing:
+        raise RuntimeError(f"BLKK32 macro verification failed: {missing}")
+    if vmacro.count("block_size == 32") != 1:
+        raise RuntimeError("Expected exactly one BLOCK_SIZE=32 dispatch branch")
+
+    print("PATCH: dispatch_utils.h BLOCK_SIZE=32 macro branch verified")
+
+
+def patch_fused_host_dispatch(src: Path):
+    fused = src / "csrc" / "fused" / "fused.cu"
+    pybind = src / "csrc" / "fused" / "pybind.cpp"
+    if not fused.is_file() or not pybind.is_file():
+        raise RuntimeError("Sage2.2 fused source files missing")
+
+    marker = "SAGE_SM75_BLKK32_HOST_DISPATCH_V1_4"
+    text = fused.read_text(encoding="utf-8")
+
+    if marker not in text:
+        include_anchor = "#include <cuda_bf16.h>\n"
+        if include_anchor not in text:
+            raise RuntimeError("fused.cu cuda_bf16 include anchor missing")
+
+        local_macro = r'''
+// SM75/Turing build marker + local dispatcher.
+extern "C" __attribute__((used, visibility("default")))
+const char SAGE_SM75_BLKK32_BUILD_MARKER[] =
+    "SAGE_SM75_BLKK32_HOST_DISPATCH_V1_4";
+
+#define DISPATCH_BLOCK_SIZE_SM75(block_size, BLOCK_SIZE, ...)    \
+  if (block_size == 32) {                                        \
+    constexpr int BLOCK_SIZE = 32;                               \
+    __VA_ARGS__                                                  \
+  } else if (block_size == 64) {                                 \
+    constexpr int BLOCK_SIZE = 64;                               \
+    __VA_ARGS__                                                  \
+  } else if (block_size == 128) {                                \
+    constexpr int BLOCK_SIZE = 128;                              \
+    __VA_ARGS__                                                  \
+  } else {                                                       \
+    std::ostringstream err_msg;                                  \
+    err_msg << "Unsupported block_size " << int(block_size);     \
+    throw std::invalid_argument(err_msg.str());                  \
+  }
+
+'''
+        text = text.replace(include_anchor, include_anchor + local_macro, 1)
+
+    count_before = text.count("DISPATCH_BLOCK_SIZE(")
+    if count_before:
+        text = text.replace("DISPATCH_BLOCK_SIZE(", "DISPATCH_BLOCK_SIZE_SM75(")
+
+    fused.write_text(text, encoding="utf-8")
+
+    verify = fused.read_text(encoding="utf-8")
+    if marker not in verify:
+        raise RuntimeError("fused.cu build marker missing after patch")
+    if "DISPATCH_BLOCK_SIZE(" in verify:
+        raise RuntimeError("Unredirected DISPATCH_BLOCK_SIZE call remains in fused.cu")
+    redirected = verify.count("DISPATCH_BLOCK_SIZE_SM75(")
+    if redirected < 4:
+        raise RuntimeError(
+            f"Too few local block-size dispatcher occurrences in fused.cu: {redirected}"
+        )
+    for token in (
+        "block_size == 32",
+        "constexpr int BLOCK_SIZE = 32;",
+        "block_size == 64",
+        "block_size == 128",
+    ):
+        if token not in verify:
+            raise RuntimeError(f"fused.cu verification missing: {token}")
+
+    ptext = pybind.read_text(encoding="utf-8")
+    if marker not in ptext:
+        if "#include <string>" not in ptext:
+            ptext = ptext.replace(
+                "#include <torch/extension.h>\n",
+                "#include <torch/extension.h>\n#include <string>\n",
+                1,
+            )
+        anchor = "PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)\n{\n"
+        if anchor not in ptext:
+            raise RuntimeError("pybind module anchor missing")
+        probe = (
+            '  m.def("_sm75_blkk32_build_info", []() { '
+            'return std::string("SAGE_SM75_BLKK32_HOST_DISPATCH_V1_4"); });\n'
+        )
+        ptext = ptext.replace(anchor, anchor + probe, 1)
+        pybind.write_text(ptext, encoding="utf-8")
+
+    pverify = pybind.read_text(encoding="utf-8")
+    if "_sm75_blkk32_build_info" not in pverify or marker not in pverify:
+        raise RuntimeError("pybind BLKK32 build probe patch failed")
+
+    print(
+        "PATCH: fused.cu explicit 32/64/128 host dispatcher; "
+        f"redirected_call_sites={redirected - 1}"
+    )
+
+
+def binary_require_blkk32(fused_so: Path, env):
+    marker = "SAGE_SM75_BLKK32_HOST_DISPATCH_V1_4"
+
+    cp = run(["strings", fused_so], env=env, check=False)
+    if cp.returncode != 0 or marker not in cp.stdout:
+        raise RuntimeError(
+            "Compiled _fused.so does not contain the v1.4 BLKK32 build marker"
+        )
+
+    if not re.search(r"QuantInt8Kernel.*ELj32E", cp.stdout):
+        raise RuntimeError(
+            "Compiled _fused.so has no visible QuantInt8Kernel BLOCK_SIZE=32 "
+            "template instantiation"
+        )
+
+    cuobjdump_require_sm75(fused_so, env)
+
+    code = (
+        "import sageattention._fused as f;"
+        "x=f._sm75_blkk32_build_info();"
+        "print(x);"
+        f"assert x == {marker!r}"
+    )
+    probe_env = env.copy()
+    probe_env["PYTHONPATH"] = str(fused_so.parent.parent)
+    run([sys.executable, "-c", code], env=probe_env)
+
+    print("PREFLIGHT: compiled _fused BLKK32 host-dispatch probe PASS")
 
 def patch_core(core: Path):
     text = core.read_text(encoding="utf-8")
@@ -415,12 +546,21 @@ def main():
     ])
     patch_sage22_setup(sage / "setup.py")
     patch_blkk32(sage)
+    patch_fused_host_dispatch(sage)
     patch_core(sage / "sageattention" / "core.py")
 
     run(
-        ["git", "diff", "--", "setup.py", "sageattention/core.py", "csrc/dispatch_utils.h"],
+        ["git", "diff", "--", "setup.py", "sageattention/core.py", "csrc/dispatch_utils.h", "csrc/fused/fused.cu", "csrc/fused/pybind.cpp"],
         cwd=sage, env=env
     )
+
+    for stale in (
+        sage / "build",
+        sage / "dist",
+        sage / "sageattention.egg-info",
+    ):
+        if stale.exists():
+            shutil.rmtree(stale)
 
     sage_dist = ws / "sage22_dist"
     sage_dist.mkdir()
@@ -436,6 +576,15 @@ def main():
         raise RuntimeError(
             f"Unexpected Sage2.2 wheel filename: {sw[0].name}; expected {TARGET_WHEEL}"
         )
+
+    sage22_tree = ws / "sage22_verify_tree"
+    unpack_wheel(sw[0], sage22_tree)
+    sage22_fused = sorted((sage22_tree / "sageattention").glob("*_fused*.so"))
+    if len(sage22_fused) != 1:
+        raise RuntimeError(
+            f"Expected exactly one Sage2.2 _fused extension, found {sage22_fused}"
+        )
+    binary_require_blkk32(sage22_fused[0], env)
 
     # Stage 3: integrate qattn into the Sage2.2-derived wheel.
     final_tree = ws / "final_tree"
@@ -464,10 +613,11 @@ def main():
             "Torch: 2.6.0+cu126",
             "CUDA toolkit: 12.6",
             "GPU architecture: SM75",
-            "Sage2.2 native INT8 preprocessing with BLOCK_SIZE=32",
+            "Sage2.2 native INT8 preprocessing with explicit fused.cu BLOCK_SIZE=32 host dispatch",
             "Turing qattn: Ph0rk0z/SageAttention2",
             "Exact geometry: BLKQ=64, WARPQ=16, BLKK=32",
             "qattn ABI built under the same Python/Torch/CUDA stack",
+            "BLKK32 binary probe: SAGE_SM75_BLKK32_HOST_DISPATCH_V1_4",
             "",
         ]),
         encoding="utf-8",
@@ -483,7 +633,7 @@ def main():
     if not final_fused:
         raise RuntimeError("Final wheel is missing Sage2.2 _fused native extension")
     cuobjdump_require_sm75(final_qattn, env)
-    cuobjdump_require_sm75(final_fused[0], env)
+    binary_require_blkk32(final_fused[0], env)
     syntax_check(verify_tree / "sageattention" / "core.py")
 
     print("\nFINAL:", final)
