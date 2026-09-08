@@ -4,17 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       sage22_ref:
-        description: Official SageAttention ref
+        description: "Official SageAttention ref"
         required: true
-        default: v2.2.0
+        default: "v2.2.0"
         type: string
       turing_ref:
-        description: Ph0rk0z Turing SageAttention2 ref
+        description: "Ph0rk0z Turing SageAttention2 ref"
         required: true
-        default: updates
+        default: "updates"
         type: string
       max_jobs:
-        description: Native compile workers
+        description: "Native compile workers"
         required: true
         default: "2"
         type: string
@@ -26,7 +26,6 @@ jobs:
   build-linux-sm75:
     runs-on: ubuntu-22.04
     timeout-minutes: 120
-
     container:
       image: nvidia/cuda:12.6.3-devel-ubuntu22.04
 
@@ -51,22 +50,28 @@ jobs:
       - name: Checkout workflow repository
         uses: actions/checkout@v4
 
-      - name: Provision Python 3.12 with UV
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+
+      - name: Create build environment and install exact dependencies with uv pip
         shell: bash
         run: |
           set -euxo pipefail
+          python -c "import sys; print(sys.version); assert sys.version_info[:2] == (3, 12)"
+          python -m venv .venv
           curl -LsSf https://astral.sh/uv/install.sh | sh
           export PATH="$HOME/.local/bin:$PATH"
-          uv python install 3.12
-          uv venv --python 3.12 .venv
-          .venv/bin/python -m ensurepip --upgrade
-          .venv/bin/python -m pip install -U pip setuptools wheel packaging ninja numpy
 
-      - name: Install exact Torch 2.6.0 + cu126
-        shell: bash
-        run: |
-          set -euxo pipefail
-          .venv/bin/python -m pip install --index-url https://download.pytorch.org/whl/cu126 torch==2.6.0
+          uv pip install --python .venv/bin/python --upgrade \
+            pip setuptools wheel packaging ninja
+
+          uv pip install --python .venv/bin/python \
+            --index-url https://download.pytorch.org/whl/cu126 \
+            torch==2.6.0
+
           .venv/bin/python - <<'PY'
           import sys, torch
           print("Python:", sys.version)
@@ -82,42 +87,58 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          .venv/bin/python build_tools/build_sage22_sm75_linux.py             --workspace "$GITHUB_WORKSPACE/_sage_build"             --sage22-ref "${{ inputs.sage22_ref }}"             --turing-ref "${{ inputs.turing_ref }}"             --output "$GITHUB_WORKSPACE/dist"
+          .venv/bin/python build_tools/build_sage22_sm75_linux.py \
+            --workspace "$GITHUB_WORKSPACE/_sage_build" \
+            --sage22-ref "${{ inputs.sage22_ref }}" \
+            --turing-ref "${{ inputs.turing_ref }}" \
+            --output "$GITHUB_WORKSPACE/dist"
 
-      - name: Verify filename and SM75 cubins
+      - name: Verify filename, SM75 cubins, and compiled BLKK32 marker
         shell: bash
         run: |
           set -euxo pipefail
           test -f "dist/${TARGET_WHEEL}"
-          rm -rf _inspect
-          mkdir _inspect
+          rm -rf _inspect && mkdir _inspect
           .venv/bin/python -m zipfile -e "dist/${TARGET_WHEEL}" _inspect
-          FOUND=0
-          while IFS= read -r so; do
-            echo "=== $so ==="
-            if /usr/local/cuda/bin/cuobjdump --list-elf "$so" | tee /tmp/cuobjdump.txt | grep -E 'sm_75|sm75'; then
-              FOUND=1
-            fi
-          done < <(find _inspect -type f -name '*.so')
-          test "$FOUND" = "1"
 
-      - name: Clean install and import test
+          QATTN="$(find _inspect/sageattention -type f -name '*_qattn_sm80*.so' | head -1)"
+          FUSED="$(find _inspect/sageattention -type f -name '*_fused*.so' | head -1)"
+          test -n "$QATTN"
+          test -n "$FUSED"
+
+          /usr/local/cuda/bin/cuobjdump --list-elf "$QATTN" | grep -E 'sm_75|sm75'
+          /usr/local/cuda/bin/cuobjdump --list-elf "$FUSED" | grep -E 'sm_75|sm75'
+          strings "$FUSED" | grep -F 'SAGE_SM75_BLKK32_HOST_DISPATCH_V1_4'
+          strings "$FUSED" | grep -E 'QuantInt8Kernel.*ELj32E'
+
+      - name: Clean install and host-only binary probe
         shell: bash
         run: |
           set -euxo pipefail
           export PATH="$HOME/.local/bin:$PATH"
-          uv venv --python 3.12 _validate
-          _validate/bin/python -m ensurepip --upgrade
-          _validate/bin/python -m pip install --index-url https://download.pytorch.org/whl/cu126 torch==2.6.0
-          _validate/bin/python -m pip install --no-deps "dist/${TARGET_WHEEL}"
+          python -m venv _validate
+
+          uv pip install --python _validate/bin/python \
+            --index-url https://download.pytorch.org/whl/cu126 \
+            torch==2.6.0
+
+          uv pip install --python _validate/bin/python \
+            --no-deps "dist/${TARGET_WHEEL}"
+
           _validate/bin/python - <<'PY'
           import sys, torch, sageattention
+          import sageattention._fused as fused
           from sageattention import sageattn
+
           print("Python:", sys.version)
           print("Torch:", torch.__version__)
           print("Torch CUDA:", torch.version.cuda)
           print("Sage:", sageattention.__file__)
+          print("BLKK32 probe:", fused._sm75_blkk32_build_info())
+
           assert callable(sageattn)
+          assert fused._sm75_blkk32_build_info() == \
+              "SAGE_SM75_BLKK32_HOST_DISPATCH_V1_4"
           PY
 
       - name: Checksums and manifest
@@ -137,12 +158,14 @@ jobs:
           sage22_ref=${{ inputs.sage22_ref }}
           turing_ref=${{ inputs.turing_ref }}
           native_builder=python_-m_pip_wheel
+          installer=uv_pip
+          blkk32_binary_probe=SAGE_SM75_BLKK32_HOST_DISPATCH_V1_4
           EOF
 
       - name: Upload Sage wheel artifact
         uses: actions/upload-artifact@v6
         with:
-          name: sageattention-sm75-py312-torch260-cu126-linux
+          name: sageattention-sm75-py312-torch260-cu126-linux-v1-4
           path: |
             dist/*.whl
             dist/SHA256SUMS.txt
