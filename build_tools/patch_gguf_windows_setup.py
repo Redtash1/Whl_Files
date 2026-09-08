@@ -10,3 +10,58 @@ def main():
     compile(text,str(p),"exec"); p.write_text(text,encoding="utf-8")
     print("PASS: setup.py MSVC discovery patched")
 if __name__ == "__main__": main()
+
+# v1.6: explicitly forward VS/Windows SDK INCLUDE and LIB paths into
+# Torch CUDAExtension. v1.5 proved corecrt.h exists, but nvcc's host CL
+# invocation did not inherit the UCRT search path.
+text = setup_path.read_text(encoding="utf-8")
+
+old_env_lists = (
+    'EXTRA_INCLUDE_DIRS = _env_path_list("LLAMACPP_GGUF_CUDA_INCLUDE_DIRS")\n'
+    'EXTRA_LIBRARY_DIRS = _env_path_list("LLAMACPP_GGUF_CUDA_LIB_DIRS")\n'
+)
+new_env_lists = (
+    'EXTRA_INCLUDE_DIRS = _env_path_list("LLAMACPP_GGUF_CUDA_INCLUDE_DIRS")\n'
+    'EXTRA_LIBRARY_DIRS = _env_path_list("LLAMACPP_GGUF_CUDA_LIB_DIRS")\n'
+    'if os.name == "nt":\n'
+    '    EXTRA_INCLUDE_DIRS += _env_path_list("INCLUDE")\n'
+    '    EXTRA_LIBRARY_DIRS += _env_path_list("LIB")\n'
+)
+if text.count(old_env_lists) != 1:
+    raise RuntimeError("Expected EXTRA include/library anchor exactly once")
+text = text.replace(old_env_lists, new_env_lists, 1)
+
+old_attention = (
+    '    CUDAExtension(\n'
+    '        name="llamacpp_gguf_cuda._attention",\n'
+    '        sources=[str(CSRC / "q8_paged_attention_bindings.cpp"), str(CSRC / "sm120_bindings.cpp"), str(CSRC / "q8_paged_attention.cu")],\n'
+    '        extra_compile_args=extra_compile_args,\n'
+    '        extra_link_args=EXTRA_LINK_ARGS,\n'
+    '        library_dirs=EXTRA_LIBRARY_DIRS,\n'
+    '        libraries=["cuda"],\n'
+    '    ),\n'
+)
+new_attention = (
+    '    CUDAExtension(\n'
+    '        name="llamacpp_gguf_cuda._attention",\n'
+    '        sources=[str(CSRC / "q8_paged_attention_bindings.cpp"), str(CSRC / "sm120_bindings.cpp"), str(CSRC / "q8_paged_attention.cu")],\n'
+    '        include_dirs=EXTRA_INCLUDE_DIRS,\n'
+    '        extra_compile_args=extra_compile_args,\n'
+    '        extra_link_args=EXTRA_LINK_ARGS,\n'
+    '        library_dirs=EXTRA_LIBRARY_DIRS,\n'
+    '        libraries=["cuda"],\n'
+    '    ),\n'
+)
+if text.count(old_attention) != 1:
+    raise RuntimeError("Expected _attention CUDAExtension anchor exactly once")
+text = text.replace(old_attention, new_attention, 1)
+
+setup_path.write_text(text, encoding="utf-8")
+check = setup_path.read_text(encoding="utf-8")
+if 'EXTRA_INCLUDE_DIRS += _env_path_list("INCLUDE")' not in check:
+    raise RuntimeError("Windows INCLUDE forwarding patch missing")
+if 'EXTRA_LIBRARY_DIRS += _env_path_list("LIB")' not in check:
+    raise RuntimeError("Windows LIB forwarding patch missing")
+if check.count("include_dirs=EXTRA_INCLUDE_DIRS") != 1:
+    raise RuntimeError("_attention include_dirs patch missing or duplicated")
+print("[patch] Windows SDK/UCRT paths forwarded explicitly to CUDAExtension")
