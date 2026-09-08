@@ -168,9 +168,29 @@ jobs:
           $pyproject = "$llama\pyproject.toml"
           python build_tools\patch_gguf_build_release.py $helper
           python build_tools\patch_gguf_windows_setup.py $setup
+          if ($LASTEXITCODE -ne 0) { throw "setup.py patcher failed" }
+
+          $setupText = Get-Content $setup -Raw
+          foreach ($marker in @(
+            'EXTRA_INCLUDE_DIRS += _env_path_list("INCLUDE")',
+            'EXTRA_LIBRARY_DIRS += _env_path_list("LIB")',
+            'include_dirs=EXTRA_INCLUDE_DIRS'
+          )) {
+            if (-not $setupText.Contains($marker)) {
+              throw "Actual patched setup.py missing required marker: $marker"
+            }
+          }
+          "PASS: actual setup.py contains explicit Windows SDK/UCRT CUDAExtension paths" |
+            Tee-Object "$env:RUNNER_TEMP\gguf-artifact\setup_patch_preflight.txt"
+
           python build_tools\patch_gguf_pyproject_py312.py $pyproject
           python -m py_compile $helper $setup
           git -C "$env:RUNNER_TEMP\kernels" diff -- llama.cpp/scripts/build_release.py llama.cpp/setup.py llama.cpp/pyproject.toml | Tee-Object "$env:RUNNER_TEMP\gguf-artifact\source_patches.diff"
+
+          $diffText = Get-Content "$env:RUNNER_TEMP\gguf-artifact\source_patches.diff" -Raw
+          if (-not $diffText.Contains('EXTRA_INCLUDE_DIRS += _env_path_list("INCLUDE")')) {
+            throw "source_patches.diff missing Windows INCLUDE forwarding patch"
+          }
           $verify = @'
           import sys, tomllib
           from pathlib import Path
