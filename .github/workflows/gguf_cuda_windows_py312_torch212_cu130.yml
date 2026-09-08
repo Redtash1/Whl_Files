@@ -204,12 +204,109 @@ jobs:
           if (-not (Test-Path "$env:CUDA_HOME\include\cuda_runtime.h")) { throw "CUDA headers missing" }
           if (-not (Test-Path "$env:CUDA_HOME\lib\x64\cudart.lib")) { throw "CUDA import libs missing" }
 
+      - name: Activate and verify Visual Studio developer environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "Visual Studio 2022 with MSVC x64 tools not found" }
+
+          $vsDevCmd = Join-Path $vs "Common7\Tools\VsDevCmd.bat"
+          if (-not (Test-Path $vsDevCmd)) { throw "VsDevCmd.bat not found: $vsDevCmd" }
+
+          # Import the same compiler + Windows SDK environment provided by a
+          # Visual Studio x64 Developer Command Prompt.
+          $cmd = "`"$vsDevCmd`" -no_logo -arch=x64 -host_arch=x64 >nul && set"
+          $lines = & cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "VsDevCmd.bat failed with exit code $LASTEXITCODE" }
+
+          $persist = @(
+            "INCLUDE",
+            "LIB",
+            "LIBPATH",
+            "VCToolsInstallDir",
+            "VCINSTALLDIR",
+            "VSINSTALLDIR",
+            "WindowsSdkDir",
+            "WindowsSDKVersion",
+            "UCRTVersion"
+          )
+
+          foreach ($line in $lines) {
+            $idx = $line.IndexOf("=")
+            if ($idx -le 0) { continue }
+            $name = $line.Substring(0, $idx)
+            $value = $line.Substring($idx + 1)
+
+            [Environment]::SetEnvironmentVariable($name, $value, "Process")
+
+            if ($persist -contains $name) {
+              "$name=$value" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            }
+          }
+
+          # Preserve the VS/Windows SDK PATH additions for following steps.
+          $devPath = [Environment]::GetEnvironmentVariable("PATH", "Process")
+          foreach ($entry in $devPath.Split(";")) {
+            if ($entry -and (Test-Path $entry)) {
+              $entry | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+            }
+          }
+
+          $cl = (Get-Command cl.exe -ErrorAction Stop).Source
+          if (-not $env:INCLUDE) { throw "INCLUDE is empty after VsDevCmd" }
+          if (-not $env:LIB) { throw "LIB is empty after VsDevCmd" }
+          if (-not $env:WindowsSdkDir) { throw "WindowsSdkDir is empty after VsDevCmd" }
+
+          $corecrt = $null
+          foreach ($inc in $env:INCLUDE.Split(";")) {
+            if (-not $inc) { continue }
+            $candidate = Join-Path $inc "corecrt.h"
+            if (Test-Path $candidate) {
+              $corecrt = $candidate
+              break
+            }
+          }
+          if (-not $corecrt) {
+            throw "corecrt.h was not found on INCLUDE after VsDevCmd activation"
+          }
+
+          @(
+            "PASS: Visual Studio developer environment activated",
+            "cl.exe: $cl",
+            "WindowsSdkDir: $env:WindowsSdkDir",
+            "WindowsSDKVersion: $env:WindowsSDKVersion",
+            "UCRTVersion: $env:UCRTVersion",
+            "corecrt.h: $corecrt",
+            "INCLUDE: $env:INCLUDE",
+            "LIB: $env:LIB"
+          ) | Tee-Object "$env:RUNNER_TEMP\gguf-artifact\vsdevcmd_preflight.txt"
+
       - name: Build toolkit-wide Windows wheel
         id: build
         continue-on-error: true
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
+
+          # Fail before the expensive CUDA build if the Windows SDK/UCRT
+          # environment did not persist from the preflight step.
+          if (-not $env:INCLUDE) {
+            throw "Visual Studio INCLUDE environment was not persisted"
+          }
+          $corecrtFound = $false
+          foreach ($inc in $env:INCLUDE.Split(";")) {
+            if ($inc -and (Test-Path (Join-Path $inc "corecrt.h"))) {
+              $corecrtFound = $true
+              break
+            }
+          }
+          if (-not $corecrtFound) {
+            throw "corecrt.h is not visible to the native build through INCLUDE"
+          }
+
           $src = "$env:RUNNER_TEMP\kernels\llama.cpp"
           $work = "$env:RUNNER_TEMP\gguf-build\win312"
           $dist = "$env:RUNNER_TEMP\gguf-build\dist"
