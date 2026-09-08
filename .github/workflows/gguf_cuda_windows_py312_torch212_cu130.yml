@@ -145,41 +145,44 @@ jobs:
             throw "Upstream build_release.py not found"
           }
 
-      - name: Patch upstream release helper, Windows MSVC discovery, and Python metadata
+      - name: Preflight exact upstream source layout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $llama = "$env:RUNNER_TEMP\kernels\llama.cpp"
+          foreach ($p in @("$llama\setup.py","$llama\pyproject.toml","$llama\scripts\build_release.py")) {
+            if (-not (Test-Path $p)) { throw "Required upstream file missing: $p" }
+          }
+          $gate = 'requires-python = ">=3.10,<3.12"'
+          $n = (Select-String -Path "$llama\pyproject.toml" -SimpleMatch $gate).Count
+          if ($n -ne 1) { throw "Expected exactly one Python gate in pyproject.toml; found $n" }
+          "PASS: exact upstream source layout confirmed" | Tee-Object "$env:RUNNER_TEMP\gguf-artifact\source_layout_preflight.txt"
+
+      - name: Patch exact upstream Py312 gates and Windows MSVC discovery
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $llama = "$env:RUNNER_TEMP\kernels\llama.cpp"
           $helper = "$llama\scripts\build_release.py"
           $setup = "$llama\setup.py"
-
+          $pyproject = "$llama\pyproject.toml"
           python build_tools\patch_gguf_build_release.py $helper
           python build_tools\patch_gguf_windows_setup.py $setup
+          python build_tools\patch_gguf_pyproject_py312.py $pyproject
           python -m py_compile $helper $setup
-
-          git -C "$env:RUNNER_TEMP\kernels" diff -- `
-            llama.cpp/scripts/build_release.py llama.cpp/setup.py |
-            Tee-Object "$env:RUNNER_TEMP\gguf-artifact\source_patches.diff"
-
-          $code = @'
+          git -C "$env:RUNNER_TEMP\kernels" diff -- llama.cpp/scripts/build_release.py llama.cpp/setup.py llama.cpp/pyproject.toml | Tee-Object "$env:RUNNER_TEMP\gguf-artifact\source_patches.diff"
+          $verify = @'
+          import sys, tomllib
           from pathlib import Path
-          import re
-          import sys
           from packaging.specifiers import SpecifierSet
-
-          setup = Path(sys.argv[1]).read_text(encoding="utf-8")
-          m = re.search(r'python_requires\s*=\s*["\']([^"\']+)["\']', setup)
-          if not m:
-              raise SystemExit("python_requires not found in setup.py")
-
-          spec = SpecifierSet(m.group(1))
-          print("python_requires:", m.group(1))
-          print("Python 3.12 allowed:", "3.12" in spec)
-          if "3.12" not in spec:
-              raise SystemExit("Patched package metadata still rejects Python 3.12")
+          raw=tomllib.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["project"]["requires-python"]
+          spec=SpecifierSet(raw)
+          print("requires-python:",raw)
+          if "3.12" not in spec: raise SystemExit("Python 3.12 still rejected")
+          if "3.13" in spec: raise SystemExit("Python 3.13 unexpectedly accepted")
+          print("PASS: Python 3.12 accepted; Python 3.13 rejected")
           '@
-          $code | python - $setup |
-            Tee-Object "$env:RUNNER_TEMP\gguf-artifact\python_requires_preflight.txt"
+          $verify | python - $pyproject | Tee-Object "$env:RUNNER_TEMP\gguf-artifact\python_requires_preflight.txt"
 
       - name: Environment preflight before expensive build
         shell: pwsh
