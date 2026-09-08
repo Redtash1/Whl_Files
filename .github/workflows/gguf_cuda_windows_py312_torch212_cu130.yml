@@ -1,0 +1,271 @@
+name: Build Windows GGUF CUDA Py312 Torch2.12 CU130
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "deepbeepmeep/kernels branch, tag, or commit"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    env:
+      PYTHON_VERSION: "3.12"
+      TORCH_VERSION: "2.12.0"
+      TORCH_INDEX: "https://download.pytorch.org/whl/cu130"
+      CUDA_TOOLKIT_VERSION: "13.1"
+      CUDA_HOME_FIXED: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1'
+      UPSTREAM_REF: ${{ inputs.upstream_ref }}
+      MAX_JOBS: "2"
+      LLAMACPP_GGUF_CUDA_NVCC_THREADS: "2"
+      EXPECTED_WHEEL_NAME: "llamacpp_gguf_cuda-1.0.21+torch2.12cu130-cp312-cp312-win_amd64.whl"
+
+    steps:
+      - name: Checkout builder files
+        uses: actions/checkout@v7
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+
+      - name: Preflight runner and MSVC
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python --version
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found" }
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "MSVC x64 build tools not found" }
+          Write-Host "Visual Studio: $vs"
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\gguf-artifact" | Out-Null
+          "Visual Studio: $vs" | Out-File "$env:RUNNER_TEMP\gguf-artifact\msvc_preflight.txt"
+
+      - name: Install uv
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --disable-pip-version-check --upgrade uv
+          uv --version
+
+      - name: Install Torch 2.12 cu130 and build dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          uv pip install --python python --index-url "$env:TORCH_INDEX" "torch==$env:TORCH_VERSION"
+          uv pip install --python python pip setuptools wheel packaging ninja cmake numpy
+          $code = @'
+          import sys, torch
+          print("Python:", sys.version)
+          print("Torch:", torch.__version__)
+          print("Torch CUDA runtime:", torch.version.cuda)
+          assert sys.version_info[:2] == (3, 12)
+          assert torch.__version__.split("+")[0] == "2.12.0"
+          assert torch.version.cuda == "13.0"
+          '@
+          $code | python -
+
+      - name: Install CUDA 13.1 build toolkit from NVIDIA redistributables
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cuda = $env:CUDA_HOME_FIXED
+          New-Item -ItemType Directory -Force -Path $cuda | Out-Null
+          $downloads = Join-Path $env:RUNNER_TEMP "cuda131"
+          Remove-Item -Recurse -Force $downloads -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $downloads | Out-Null
+          Set-Location $downloads
+
+          $archives = @(
+            @("cuda_crt-windows-x86_64-13.1.80-archive.zip", "https://developer.download.nvidia.com/compute/cuda/redist/cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.1.80-archive.zip"),
+            @("cuda_cudart-windows-x86_64-13.1.80-archive.zip", "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.1.80-archive.zip"),
+            @("cuda_nvcc-windows-x86_64-13.1.80-archive.zip", "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.1.80-archive.zip"),
+            @("cuda_nvrtc-windows-x86_64-13.1.80-archive.zip", "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-13.1.80-archive.zip"),
+            @("libcublas-windows-x86_64-13.2.0.9-archive.zip", "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-13.2.0.9-archive.zip"),
+            @("libnvvm-windows-x86_64-13.1.80-archive.zip", "https://developer.download.nvidia.com/compute/cuda/redist/libnvvm/windows-x86_64/libnvvm-windows-x86_64-13.1.80-archive.zip"),
+            @("cuda_nvtx-windows-x86_64-13.1.68-archive.zip", "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-13.1.68-archive.zip"),
+            @("cuda_profiler_api-windows-x86_64-13.1.80-archive.zip", "https://developer.download.nvidia.com/compute/cuda/redist/cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-13.1.80-archive.zip"),
+            @("visual_studio_integration-windows-x86_64-13.1.68-archive.zip", "https://developer.download.nvidia.com/compute/cuda/redist/visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-13.1.68-archive.zip"),
+            @("cuda_cccl-windows-x86_64-13.1.78-archive.zip", "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-13.1.78-archive.zip")
+          )
+
+          foreach ($a in $archives) {
+            $file = $a[0]
+            $url = $a[1]
+            Write-Host "Downloading $file"
+            Invoke-WebRequest -Uri $url -OutFile $file -UseBasicParsing
+            $extract = Join-Path $downloads ([IO.Path]::GetFileNameWithoutExtension($file))
+            Expand-Archive -Path $file -DestinationPath $extract -Force
+            $top = Get-ChildItem $extract -Directory | Select-Object -First 1
+            if (-not $top) { throw "No extracted directory found for $file" }
+            Copy-Item -Path (Join-Path $top.FullName "*") -Destination $cuda -Recurse -Force
+          }
+
+          if (-not (Test-Path "$cuda\bin\nvcc.exe")) { throw "nvcc.exe missing" }
+          if (-not (Test-Path "$cuda\include\cuda_runtime.h")) { throw "cuda_runtime.h missing" }
+          if (-not (Test-Path "$cuda\lib\x64\cudart.lib")) { throw "cudart.lib missing" }
+
+          "CUDA_HOME=$cuda" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CUDA_PATH=$cuda" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$cuda\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+          & "$cuda\bin\nvcc.exe" --version | Tee-Object "$env:RUNNER_TEMP\gguf-artifact\nvcc_version.txt"
+          & "$cuda\bin\nvcc.exe" --list-gpu-code | Tee-Object "$env:RUNNER_TEMP\gguf-artifact\nvcc_gpu_codes.txt"
+
+      - name: Clone exact upstream source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = "$env:RUNNER_TEMP\kernels"
+          Remove-Item -Recurse -Force $src -ErrorAction SilentlyContinue
+          git clone https://github.com/deepbeepmeep/kernels.git $src
+          Set-Location $src
+          git checkout "$env:UPSTREAM_REF"
+          $commit = git rev-parse HEAD
+          $commit | Tee-Object "$env:RUNNER_TEMP\gguf-artifact\upstream_commit.txt"
+          if (-not (Test-Path "$src\llama.cpp\scripts\build_release.py")) {
+            throw "Upstream build_release.py not found"
+          }
+
+      - name: Patch upstream release helper for Py312 Torch2.12 cu130
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $helper = "$env:RUNNER_TEMP\kernels\llama.cpp\scripts\build_release.py"
+          python build_tools\patch_gguf_build_release.py $helper
+          python -m py_compile $helper
+          git -C "$env:RUNNER_TEMP\kernels" diff -- llama.cpp/scripts/build_release.py |
+            Tee-Object "$env:RUNNER_TEMP\gguf-artifact\build_release_py312_patch.diff"
+
+      - name: Environment preflight before expensive build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $code = @'
+          import os, sys, torch
+          print("Python:", sys.version)
+          print("Torch:", torch.__version__)
+          print("Torch CUDA:", torch.version.cuda)
+          print("CUDA_HOME:", os.environ.get("CUDA_HOME"))
+          assert sys.version_info[:2] == (3, 12)
+          assert torch.__version__.split("+")[0] == "2.12.0"
+          assert torch.version.cuda == "13.0"
+          '@
+          $code | python - | Tee-Object "$env:RUNNER_TEMP\gguf-artifact\python_torch_environment.txt"
+
+          & "$env:CUDA_HOME\bin\nvcc.exe" --version
+          if (-not (Test-Path "$env:CUDA_HOME\include\cuda_runtime.h")) { throw "CUDA headers missing" }
+          if (-not (Test-Path "$env:CUDA_HOME\lib\x64\cudart.lib")) { throw "CUDA import libs missing" }
+
+      - name: Build toolkit-wide Windows wheel
+        id: build
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $src = "$env:RUNNER_TEMP\kernels\llama.cpp"
+          $work = "$env:RUNNER_TEMP\gguf-build\win312"
+          $dist = "$env:RUNNER_TEMP\gguf-build\dist"
+          New-Item -ItemType Directory -Force -Path $work,$dist | Out-Null
+
+          Set-Location $src
+          python scripts\build_release.py `
+            --target py312 `
+            --cuda-home "$env:CUDA_HOME" `
+            --work-dir $work `
+            --dist-dir $dist `
+            --max-jobs 2 `
+            --nvcc-threads 2
+
+          $rc = $LASTEXITCODE
+          "$rc" | Out-File "$env:RUNNER_TEMP\gguf-artifact\build_exit_code.txt"
+          if (Test-Path "$work\build.log") {
+            Copy-Item "$work\build.log" "$env:RUNNER_TEMP\gguf-artifact\build.log" -Force
+          }
+          if (Test-Path "$work\build_manifest.json") {
+            Copy-Item "$work\build_manifest.json" "$env:RUNNER_TEMP\gguf-artifact\build_manifest.json" -Force
+          }
+          if ($rc -ne 0) { exit $rc }
+
+      - name: Validate successful wheel
+        if: steps.build.outcome == 'success'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dist = "$env:RUNNER_TEMP\gguf-build\dist"
+          $wheels = @(Get-ChildItem $dist -Filter "llamacpp_gguf_cuda*.whl")
+          if ($wheels.Count -ne 1) { throw "Expected one wheel; found $($wheels.Count)" }
+          $wheel = $wheels[0]
+          Write-Host "Built wheel: $($wheel.Name)"
+          if ($wheel.Name -ne $env:EXPECTED_WHEEL_NAME) {
+            throw "Unexpected filename: $($wheel.Name); expected $env:EXPECTED_WHEEL_NAME"
+          }
+
+          Copy-Item $wheel.FullName "$env:RUNNER_TEMP\gguf-artifact\$($wheel.Name)" -Force
+          $hash = (Get-FileHash $wheel.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $($wheel.Name)" | Tee-Object "$env:RUNNER_TEMP\gguf-artifact\SHA256SUMS.txt"
+          python -m zipfile -l $wheel.FullName |
+            Out-File "$env:RUNNER_TEMP\gguf-artifact\wheel_contents.txt" -Encoding utf8
+
+      - name: Clean install and CPU-side import
+        if: steps.build.outcome == 'success'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $wheel = Get-ChildItem "$env:RUNNER_TEMP\gguf-build\dist" -Filter "llamacpp_gguf_cuda*.whl" |
+            Select-Object -First 1
+          uv pip install --python python --no-deps --reinstall $wheel.FullName
+          $code = @'
+          import sys, torch
+          import llamacpp_gguf_cuda
+          print("Python:", sys.version)
+          print("Torch:", torch.__version__)
+          print("Torch CUDA:", torch.version.cuda)
+          print("Module:", llamacpp_gguf_cuda.__file__)
+          print("CPU-side import PASS")
+          '@
+          $code | python - | Tee-Object "$env:RUNNER_TEMP\gguf-artifact\import_test.txt"
+
+      - name: Create build target manifest
+        if: always()
+        shell: pwsh
+        run: |
+          @"
+          Package: llamacpp_gguf_cuda
+          Package source version: 1.0.21
+          OS: Windows x86-64
+          ABI: CPython 3.12 / cp312
+          Torch: 2.12.0+cu130
+          Torch CUDA runtime: 13.0
+          Build toolkit: CUDA 13.1
+          Build method: upstream scripts/build_release.py extended with py312 target
+          Expected wheel: $env:EXPECTED_WHEEL_NAME
+          Upstream ref: $env:UPSTREAM_REF
+          Architecture policy: toolkit-wide from nvcc --list-gpu-code
+          "@ | Out-File "$env:RUNNER_TEMP\gguf-artifact\BUILD_TARGET.txt" -Encoding utf8
+
+      - name: Upload wheel and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: llamacpp-gguf-cuda-windows-py312-torch212-cu130
+          path: ${{ runner.temp }}\gguf-artifact\*
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Fail after diagnostics if native build failed
+        if: steps.build.outcome != 'success'
+        shell: pwsh
+        run: |
+          Write-Host "Native Windows GGUF CUDA wheel build failed. Diagnostics were uploaded."
+          exit 1
