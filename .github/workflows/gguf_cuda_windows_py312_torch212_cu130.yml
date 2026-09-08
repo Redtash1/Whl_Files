@@ -174,14 +174,18 @@ jobs:
           foreach ($marker in @(
             'EXTRA_INCLUDE_DIRS += _env_path_list("INCLUDE")',
             'EXTRA_LIBRARY_DIRS += _env_path_list("LIB")',
-            'include_dirs=EXTRA_INCLUDE_DIRS'
+            'include_dirs=EXTRA_INCLUDE_DIRS',
+            'BASE_NVCC_FLAGS.append("-I" + _inc)',
+            '_nvcc_host_include_dirs = ['
           )) {
             if (-not $setupText.Contains($marker)) {
               throw "Actual patched setup.py missing required marker: $marker"
             }
           }
-          "PASS: actual setup.py contains explicit Windows SDK/UCRT CUDAExtension paths" |
-            Tee-Object "$env:RUNNER_TEMP\gguf-artifact\setup_patch_preflight.txt"
+          @(
+            "PASS: actual setup.py contains explicit Windows SDK/UCRT CUDAExtension paths",
+            "PASS: actual setup.py injects Windows SDK/UCRT include directories directly into BASE_NVCC_FLAGS"
+          ) | Tee-Object "$env:RUNNER_TEMP\gguf-artifact\setup_patch_preflight.txt"
 
           python build_tools\patch_gguf_pyproject_py312.py $pyproject
           python -m py_compile $helper $setup
@@ -190,6 +194,9 @@ jobs:
           $diffText = Get-Content "$env:RUNNER_TEMP\gguf-artifact\source_patches.diff" -Raw
           if (-not $diffText.Contains('EXTRA_INCLUDE_DIRS += _env_path_list("INCLUDE")')) {
             throw "source_patches.diff missing Windows INCLUDE forwarding patch"
+          }
+          if (-not $diffText.Contains('BASE_NVCC_FLAGS.append("-I" + _inc)')) {
+            throw "source_patches.diff missing direct nvcc Windows SDK/UCRT include injection"
           }
           $verify = @'
           import sys, tomllib
