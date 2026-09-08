@@ -89,28 +89,99 @@ def patch_setup(setup: Path):
 
 
 def patch_blkk32(src: Path):
+    """
+    Add BLOCK_SIZE=32 to the SageAttention v2.2.0 fused preprocessing dispatcher.
+
+    v2.2.0 does NOT use a C++ switch/case here. Its csrc/dispatch_utils.h uses:
+        if (block_size == 64) { ... }
+        else if (block_size == 128) { ... }
+
+    The previous GitHub builder incorrectly looked only for a case-64 switch arm.
+    This patch handles the actual v2.2.0 macro structure and refuses to continue
+    unless the resulting macro contains 32, 64 and 128 branches.
+    """
     candidates = [p for p in src.rglob("dispatch_utils.h") if "csrc" in str(p)]
     if not candidates:
         raise RuntimeError("dispatch_utils.h not found")
+
     for path in candidates:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        if "DISPATCH_BLOCK_SIZE" not in text:
+        original = path.read_text(encoding="utf-8", errors="replace")
+        if "DISPATCH_BLOCK_SIZE" not in original:
             continue
-        if re.search(r"case\s+32\s*:", text):
-            print("PATCH: BLOCK_SIZE 32 already present", path)
+
+        # Idempotent path.
+        if re.search(r"block_size\s*==\s*32", original):
+            print("PATCH: BLOCK_SIZE=32 already present", path)
             return
-        # Duplicate the complete `case 64` arm through the next case/default.
-        m = re.search(r"(?ms)^(?P<i>[ \t]*)case\s+64\s*:.*?(?=^(?P=i)(?:case\s+\d+\s*:|default\s*:))", text)
-        if not m:
-            continue
-        block = m.group(0)
-        block32 = re.sub(r"case\s+64\s*:", "case 32:", block, count=1)
-        # The branch instantiates the block-size constant; convert only this cloned arm.
-        block32 = re.sub(r"\b64\b", "32", block32)
-        path.write_text(text[:m.start()] + block32 + text[m.start():], encoding="utf-8")
+
+        # Official SageAttention v2.2.0 macro. Capture the complete 64 branch
+        # through its __VA_ARGS__ line, then prepend an equivalent 32 branch.
+        pat = re.compile(
+            r'(?P<indent>[ \t]*)if\s*\(\s*block_size\s*==\s*64\s*\)\s*\{\s*\\\\\n'
+            r'(?P=indent)[ \t]*constexpr\s+int\s+BLOCK_SIZE\s*=\s*64\s*;\s*\\\\\n'
+            r'(?P=indent)[ \t]*__VA_ARGS__\s*\\\\\n'
+            r'(?P=indent)[ \t]*\}\s*else\s+if\s*\(\s*block_size\s*==\s*128\s*\)\s*\{\s*\\\\'
+        )
+        m = pat.search(original)
+
+        if m:
+            indent = m.group("indent")
+            replacement = (
+                f"{indent}if (block_size == 32) {{                                       \\\\\n"
+                f"{indent}  constexpr int BLOCK_SIZE = 32;                              \\\\\n"
+                f"{indent}  __VA_ARGS__                                                 \\\\\n"
+                f"{indent}}} else if (block_size == 64) {{                               \\\\\n"
+                f"{indent}  constexpr int BLOCK_SIZE = 64;                              \\\\\n"
+                f"{indent}  __VA_ARGS__                                                 \\\\\n"
+                f"{indent}}} else if (block_size == 128) {{                              \\\\"
+            )
+            patched = original[:m.start()] + replacement + original[m.end():]
+        else:
+            # More tolerant fallback: replace only the first 64 branch opener.
+            # This still matches the real v2.2.0 if whitespace changes slightly.
+            opener = re.compile(
+                r'(?P<indent>[ \t]*)if\s*\(\s*block_size\s*==\s*64\s*\)\s*\{\s*\\\\\n'
+            )
+            m2 = opener.search(original)
+            if not m2:
+                # Print the macro to the Actions log before failing so a future
+                # source-layout change is immediately diagnosable.
+                macro_at = original.find("#define DISPATCH_BLOCK_SIZE")
+                preview = original[macro_at:macro_at + 900] if macro_at >= 0 else original[:900]
+                print("DISPATCH_BLOCK_SIZE SOURCE PREVIEW:\n" + preview)
+                continue
+
+            indent = m2.group("indent")
+            insert = (
+                f"{indent}if (block_size == 32) {{                                       \\\\\n"
+                f"{indent}  constexpr int BLOCK_SIZE = 32;                              \\\\\n"
+                f"{indent}  __VA_ARGS__                                                 \\\\\n"
+                f"{indent}}} else if (block_size == 64) {{                                       \\\\\n"
+            )
+            patched = original[:m2.start()] + insert + original[m2.end():]
+
+        # Safety checks against accidental malformed/partial patching.
+        required = (
+            r"block_size\s*==\s*32",
+            r"BLOCK_SIZE\s*=\s*32",
+            r"block_size\s*==\s*64",
+            r"BLOCK_SIZE\s*=\s*64",
+            r"block_size\s*==\s*128",
+            r"BLOCK_SIZE\s*=\s*128",
+        )
+        if not all(re.search(p, patched) for p in required):
+            raise RuntimeError(f"BLOCK_SIZE=32 patch validation failed for {path}")
+
+        path.write_text(patched, encoding="utf-8")
         print("PATCH: Sage2.2 native fused dispatcher accepts BLOCK_SIZE=32", path)
+
+        # Show exactly what GitHub will compile.
+        verify = path.read_text(encoding="utf-8", errors="replace")
+        pos = verify.find("#define DISPATCH_BLOCK_SIZE")
+        print("PATCHED DISPATCH_BLOCK_SIZE:\n" + verify[pos:pos + 900])
         return
-    raise RuntimeError("could not safely patch BLOCK_SIZE=32")
+
+    raise RuntimeError("could not safely patch BLOCK_SIZE=32; see source preview above")
 
 
 def patch_core(core: Path):
