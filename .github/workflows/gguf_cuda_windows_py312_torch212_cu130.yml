@@ -47,9 +47,17 @@ jobs:
           if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found" }
           $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vs) { throw "MSVC x64 build tools not found" }
+          $msvcRoot = Join-Path $vs "VC\Tools\MSVC"
+          if (-not (Test-Path $msvcRoot)) { throw "MSVC tools root not found: $msvcRoot" }
+          $msvcVersion = Get-ChildItem $msvcRoot -Directory | Sort-Object Name | Select-Object -Last 1
+          if (-not $msvcVersion) { throw "No MSVC toolset found under $msvcRoot" }
+          $cl = Join-Path $msvcVersion.FullName "bin\Hostx64\x64\cl.exe"
+          if (-not (Test-Path $cl)) { throw "cl.exe not found: $cl" }
           Write-Host "Visual Studio: $vs"
+          Write-Host "MSVC tools: $($msvcVersion.FullName)"
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\gguf-artifact" | Out-Null
-          "Visual Studio: $vs" | Out-File "$env:RUNNER_TEMP\gguf-artifact\msvc_preflight.txt"
+          "Visual Studio: $vs`nMSVC tools: $($msvcVersion.FullName)`ncl.exe: $cl" |
+            Out-File "$env:RUNNER_TEMP\gguf-artifact\msvc_preflight.txt"
 
       - name: Install uv
         shell: pwsh
@@ -137,15 +145,18 @@ jobs:
             throw "Upstream build_release.py not found"
           }
 
-      - name: Patch upstream release helper for Py312 Torch2.12 cu130
+      - name: Patch upstream release helper and Windows MSVC discovery
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $helper = "$env:RUNNER_TEMP\kernels\llama.cpp\scripts\build_release.py"
+          $llama = "$env:RUNNER_TEMP\kernels\llama.cpp"
+          $helper = "$llama\scripts\build_release.py"
+          $setup = "$llama\setup.py"
           python build_tools\patch_gguf_build_release.py $helper
-          python -m py_compile $helper
-          git -C "$env:RUNNER_TEMP\kernels" diff -- llama.cpp/scripts/build_release.py |
-            Tee-Object "$env:RUNNER_TEMP\gguf-artifact\build_release_py312_patch.diff"
+          python build_tools\patch_gguf_windows_setup.py $setup
+          python -m py_compile $helper $setup
+          git -C "$env:RUNNER_TEMP\kernels" diff -- llama.cpp/scripts/build_release.py llama.cpp/setup.py |
+            Tee-Object "$env:RUNNER_TEMP\gguf-artifact\source_patches.diff"
 
       - name: Environment preflight before expensive build
         shell: pwsh
