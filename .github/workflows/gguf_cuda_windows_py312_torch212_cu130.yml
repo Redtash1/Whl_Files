@@ -145,18 +145,41 @@ jobs:
             throw "Upstream build_release.py not found"
           }
 
-      - name: Patch upstream release helper and Windows MSVC discovery
+      - name: Patch upstream release helper, Windows MSVC discovery, and Python metadata
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $llama = "$env:RUNNER_TEMP\kernels\llama.cpp"
           $helper = "$llama\scripts\build_release.py"
           $setup = "$llama\setup.py"
+
           python build_tools\patch_gguf_build_release.py $helper
           python build_tools\patch_gguf_windows_setup.py $setup
           python -m py_compile $helper $setup
-          git -C "$env:RUNNER_TEMP\kernels" diff -- llama.cpp/scripts/build_release.py llama.cpp/setup.py |
+
+          git -C "$env:RUNNER_TEMP\kernels" diff -- `
+            llama.cpp/scripts/build_release.py llama.cpp/setup.py |
             Tee-Object "$env:RUNNER_TEMP\gguf-artifact\source_patches.diff"
+
+          $code = @'
+          from pathlib import Path
+          import re
+          import sys
+          from packaging.specifiers import SpecifierSet
+
+          setup = Path(sys.argv[1]).read_text(encoding="utf-8")
+          m = re.search(r'python_requires\s*=\s*["\']([^"\']+)["\']', setup)
+          if not m:
+              raise SystemExit("python_requires not found in setup.py")
+
+          spec = SpecifierSet(m.group(1))
+          print("python_requires:", m.group(1))
+          print("Python 3.12 allowed:", "3.12" in spec)
+          if "3.12" not in spec:
+              raise SystemExit("Patched package metadata still rejects Python 3.12")
+          '@
+          $code | python - $setup |
+            Tee-Object "$env:RUNNER_TEMP\gguf-artifact\python_requires_preflight.txt"
 
       - name: Environment preflight before expensive build
         shell: pwsh
