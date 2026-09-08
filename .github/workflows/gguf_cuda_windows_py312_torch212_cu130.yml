@@ -62,8 +62,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          uv pip install --python python --index-url "$env:TORCH_INDEX" "torch==$env:TORCH_VERSION"
-          uv pip install --python python pip setuptools wheel packaging ninja cmake numpy
+          uv pip install --system --python python --index-url "$env:TORCH_INDEX" "torch==$env:TORCH_VERSION"
+          uv pip install --system --python python pip setuptools wheel packaging ninja cmake numpy
           $code = @'
           import sys, torch
           print("Python:", sys.version)
@@ -224,7 +224,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $wheel = Get-ChildItem "$env:RUNNER_TEMP\gguf-build\dist" -Filter "llamacpp_gguf_cuda*.whl" |
             Select-Object -First 1
-          uv pip install --python python --no-deps --reinstall $wheel.FullName
+          uv pip install --system --python python --no-deps --reinstall $wheel.FullName
           $code = @'
           import sys, torch
           import llamacpp_gguf_cuda
