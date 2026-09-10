@@ -90,7 +90,7 @@ jobs:
           from pathlib import Path
           d = Path("SageAttention/dist")
           w = next(d.glob("*.whl"))
-          t = d / "sageattention-2.2.0+sm75.torch2.12cu130.turingmma1-cp312-cp312-linux_x86_64.whl"
+          t = d / "sageattention-2.2.0+sm75.torch2.12cu130.sm75-v1.3-cp312-cp312-linux_x86_64.whl"
           if w != t:
               w.rename(t)
           print(t)
@@ -98,6 +98,6 @@ jobs:
 
       - uses: actions/upload-artifact@v6
         with:
-          name: sageattention-sm75-torch212-cu130-turingmma1
+          name: sageattention-sm75-torch212-cu130-sm75-v1.3
           path: SageAttention/dist/*.whl
           if-no-files-found: error
