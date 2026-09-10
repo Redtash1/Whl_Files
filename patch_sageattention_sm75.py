@@ -13,6 +13,18 @@ def replace_function(text: str, name: str, replacement: str) -> str:
     brace = text.find("{", pos)
     if brace < 0:
         raise RuntimeError(f"Opening brace not found: {name}")
+
+    # Include the function's template declaration in the replacement range.
+    # v1.1 started at the function declaration and left the original
+    # `template <MMAMode ...>` line behind, producing duplicate template
+    # clauses when the replacement (which also contains a template line)
+    # was inserted.
+    decl_start = text.rfind("\n", 0, pos) + 1
+    previous_line_end = max(0, decl_start - 1)
+    previous_line_start = text.rfind("\n", 0, previous_line_end) + 1
+    previous_line = text[previous_line_start:previous_line_end].strip()
+    start = previous_line_start if previous_line.startswith("template <") else decl_start
+
     depth = 0
     i = brace
     while i < len(text):
@@ -21,7 +33,6 @@ def replace_function(text: str, name: str, replacement: str) -> str:
         elif text[i] == "}":
             depth -= 1
             if depth == 0:
-                start = text.rfind("\n", 0, pos) + 1
                 return text[:start] + replacement.rstrip() + "\n" + text[i+1:]
         i += 1
     raise RuntimeError(f"Closing brace not found: {name}")
@@ -166,6 +177,12 @@ def sanity():
     ]:
         if token not in mma:
             raise RuntimeError(f"mma sanity missing: {token}")
+
+    # Ensure we did not leave the original template declaration in place.
+    if re.search(r"template\s*<MMAMode[^\n]*>\s*\n\s*template\s*<MMAMode", mma):
+        raise RuntimeError("duplicate MMAMode template declaration detected")
+
+    print("[PASS] No duplicate template declarations")
     print("[PASS] SM75 setup.py architecture route installed")
     print("[PASS] Turing FP16 MMA compatibility installed")
     print("[PASS] Turing INT8 MMA compatibility installed")
