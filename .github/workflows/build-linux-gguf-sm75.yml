@@ -1,0 +1,166 @@
+name: Build GGUF CUDA Linux SM75 Torch 2.12 cu130
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      PYTHON_VERSION: "3.12"
+      TORCH_INDEX: "https://download.pytorch.org/whl/cu130"
+      TORCH_VERSION: "2.12.0"
+      CUDA_VERSION: "13.1"
+      CUDA_HOME: "/usr/local/cuda-13.1"
+      TORCH_CUDA_ARCH_LIST: "7.5"
+      MAX_JOBS: "2"
+      LLAMACPP_GGUF_CUDA_NVCC_THREADS: "2"
+      UPSTREAM_REPO: "https://github.com/deepbeepmeep/kernels.git"
+      UPSTREAM_COMMIT: "2808bfb073bd91e4fe3ef83712f600b8d642579b"
+      EXPECTED_WHEEL: "llamacpp_gguf_cuda-1.0.21+torch2.12cu130-cp312-cp312-linux_x86_64.whl"
+
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.10"
+          cache: pip
+
+      - name: Install CUDA 13.1 toolkit
+        shell: bash
+        run: |
+          set -euxo pipefail
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y cuda-toolkit-13-1 build-essential python3-dev ninja-build git
+          "$CUDA_HOME/bin/nvcc" --version
+          "$CUDA_HOME/bin/nvcc" --list-gpu-code | grep -E 'sm_75|compute_75' || true
+
+      - name: Install Torch 2.12.0 cu130 and build tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip setuptools wheel ninja packaging
+          python -m pip install --index-url "$TORCH_INDEX" "torch==${TORCH_VERSION}+cu130"
+          python - <<'PY'
+          import sys, torch
+          print('Python:', sys.version)
+          print('Torch:', torch.__version__)
+          print('Torch CUDA:', torch.version.cuda)
+          assert sys.version_info[:2] == (3, 12)
+          assert torch.__version__ == '2.12.0+cu130'
+          assert torch.version.cuda == '13.0'
+          PY
+
+      - name: Clone exact upstream source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone "$UPSTREAM_REPO" kernels
+          cd kernels
+          git checkout "$UPSTREAM_COMMIT"
+          git submodule update --init --recursive
+          git rev-parse HEAD
+
+      - name: Prepare Python 3.12 package metadata
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd kernels/llama.cpp
+          python "$GITHUB_WORKSPACE/scripts/patch_py312_and_version.py" .
+
+      - name: Build SM75-only Linux wheel
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd kernels/llama.cpp
+          rm -rf build dist *.egg-info src/*.egg-info
+          export PATH="$CUDA_HOME/bin:$PATH"
+          export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+          export CUDACXX="$CUDA_HOME/bin/nvcc"
+          export CUDAHOSTCXX="$(command -v g++)"
+          export TORCH_CUDA_ARCH_LIST="7.5"
+          export MAX_JOBS="2"
+          export LLAMACPP_GGUF_CUDA_NVCC_THREADS="2"
+          python -m pip wheel . --no-build-isolation --no-deps -w dist 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          ls -lah dist
+
+      - name: Normalize and inspect wheel name
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd kernels/llama.cpp/dist
+          WHEEL="$(ls -1 llamacpp_gguf_cuda-*.whl | head -n1)"
+          echo "Built: $WHEEL"
+          cp "$WHEEL" "$GITHUB_WORKSPACE/$EXPECTED_WHEEL"
+          python -m zipfile -l "$GITHUB_WORKSPACE/$EXPECTED_WHEEL" | head -n 80
+
+      - name: Validate wheel install and import
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --force-reinstall --no-deps "$GITHUB_WORKSPACE/$EXPECTED_WHEEL"
+          python - <<'PY'
+          import importlib.metadata as im
+          import torch
+          import llamacpp_gguf_cuda as g
+          print('Torch:', torch.__version__)
+          print('Torch CUDA:', torch.version.cuda)
+          print('GGUF module:', g.__file__)
+          try:
+              print('GGUF version:', im.version('llamacpp-gguf-cuda'))
+          except Exception as e:
+              print('GGUF metadata warning:', e)
+          print('Import: PASS')
+          PY
+
+      - name: Write build result
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "Target wheel: $EXPECTED_WHEEL"
+            echo "Python: 3.12.10"
+            echo "Torch: 2.12.0+cu130"
+            echo "Torch CUDA runtime: 13.0"
+            echo "CUDA toolkit: 13.1"
+            echo "Architecture: SM75 / Tesla T4"
+            echo "Upstream: $UPSTREAM_REPO"
+            echo "Upstream commit: $UPSTREAM_COMMIT"
+            echo "Build command: python -m pip wheel . --no-build-isolation --no-deps -w dist"
+          } > BUILD_RESULT.txt
+          if [ -f "$EXPECTED_WHEEL" ]; then
+            sha256sum "$EXPECTED_WHEEL" >> BUILD_RESULT.txt
+          fi
+          cat BUILD_RESULT.txt
+
+      - name: Upload wheel artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llamacpp-gguf-cuda-linux-sm75-py312-torch212-cu130
+          path: |
+            ${{ env.EXPECTED_WHEEL }}
+            BUILD_RESULT.txt
+            build.log
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llamacpp-gguf-cuda-linux-sm75-build-diagnostics
+          path: |
+            BUILD_RESULT.txt
+            build.log
+          if-no-files-found: ignore
+          retention-days: 30
