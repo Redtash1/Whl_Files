@@ -43,6 +43,28 @@ jobs:
           "$CUDA_HOME/bin/nvcc" --version
           "$CUDA_HOME/bin/nvcc" --list-gpu-code | grep -E 'sm_75|compute_75' || true
 
+          # GitHub-hosted runners have the CUDA toolkit but no NVIDIA driver.
+          # The _attention extension links against -lcuda, so expose the toolkit's
+          # driver stub for link-time only. Kaggle will provide the real libcuda.so.1.
+          CUDA_STUB_DIR=""
+          for d in \
+            "$CUDA_HOME/targets/x86_64-linux/lib/stubs" \
+            "$CUDA_HOME/lib64/stubs"; do
+            if [ -f "$d/libcuda.so" ]; then
+              CUDA_STUB_DIR="$d"
+              break
+            fi
+          done
+          if [ -z "$CUDA_STUB_DIR" ]; then
+            echo "ERROR: CUDA driver stub libcuda.so was not found under $CUDA_HOME" >&2
+            find "$CUDA_HOME" -name 'libcuda.so*' -print || true
+            exit 1
+          fi
+          echo "CUDA stub: $CUDA_STUB_DIR/libcuda.so"
+          echo "CUDA_STUB_DIR=$CUDA_STUB_DIR" >> "$GITHUB_ENV"
+          sudo ln -sf "$CUDA_STUB_DIR/libcuda.so" "$CUDA_HOME/lib64/libcuda.so"
+          ls -l "$CUDA_HOME/lib64/libcuda.so"
+
       - name: Install Torch 2.12.0 cu130 and build tools
         shell: bash
         run: |
@@ -84,6 +106,8 @@ jobs:
           rm -rf build dist *.egg-info src/*.egg-info
           export PATH="$CUDA_HOME/bin:$PATH"
           export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+          export LIBRARY_PATH="$CUDA_STUB_DIR:$CUDA_HOME/lib64:${LIBRARY_PATH:-}"
+          export LDFLAGS="-L$CUDA_STUB_DIR ${LDFLAGS:-}"
           export CUDACXX="$CUDA_HOME/bin/nvcc"
           export CUDAHOSTCXX="$(command -v g++)"
           export TORCH_CUDA_ARCH_LIST="7.5"
@@ -102,24 +126,43 @@ jobs:
           cp "$WHEEL" "$GITHUB_WORKSPACE/$EXPECTED_WHEEL"
           python -m zipfile -l "$GITHUB_WORKSPACE/$EXPECTED_WHEEL" | head -n 80
 
-      - name: Validate wheel install and import
+      - name: Validate built wheel without requiring an NVIDIA driver
         shell: bash
         run: |
           set -euxo pipefail
           python -m pip install --force-reinstall --no-deps "$GITHUB_WORKSPACE/$EXPECTED_WHEEL"
           python - <<'PY'
           import importlib.metadata as im
+          import pathlib
+          import sys
           import torch
-          import llamacpp_gguf_cuda as g
+
+          print('Python:', sys.version)
           print('Torch:', torch.__version__)
           print('Torch CUDA:', torch.version.cuda)
-          print('GGUF module:', g.__file__)
-          try:
-              print('GGUF version:', im.version('llamacpp-gguf-cuda'))
-          except Exception as e:
-              print('GGUF metadata warning:', e)
-          print('Import: PASS')
+          print('GGUF metadata:', im.version('llamacpp-gguf-cuda'))
+
+          site = pathlib.Path(next(p for p in sys.path if p.endswith('site-packages')))
+          pkg = site / 'llamacpp_gguf_cuda'
+          shared = sorted(pkg.glob('*.so'))
+          print('GGUF package:', pkg)
+          print('Shared objects:')
+          for p in shared:
+              print(' -', p.name, p.stat().st_size, 'bytes')
+          assert any(p.name.startswith('_C.') for p in shared), '_C extension missing'
+          assert any(p.name.startswith('_attention.') for p in shared), '_attention extension missing'
+          print('Wheel structure: PASS')
+          print('CUDA runtime import is intentionally deferred to Kaggle T4 (hosted runner has no NVIDIA driver).')
           PY
+
+          PKG_DIR="$(python - <<'PY'
+          import pathlib, sys
+          print(pathlib.Path(next(p for p in sys.path if p.endswith('site-packages'))) / 'llamacpp_gguf_cuda')
+          PY
+          )"
+          echo "ELF dependencies:"
+          readelf -d "$PKG_DIR"/_C*.so | grep -E 'NEEDED|RPATH|RUNPATH' || true
+          readelf -d "$PKG_DIR"/_attention*.so | grep -E 'NEEDED|RPATH|RUNPATH' || true
 
       - name: Write build result
         if: always()
