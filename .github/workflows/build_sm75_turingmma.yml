@@ -1,0 +1,102 @@
+name: Build SageAttention 2.2 SM75 Turing MMA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install CUDA 13.0 toolkit
+        run: |
+          set -euxo pipefail
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y cuda-toolkit-13-0
+          echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
+          /usr/local/cuda-13.0/bin/nvcc --version
+
+      - name: Install Torch/build requirements
+        run: |
+          set -euxo pipefail
+          python -m pip install -U pip uv setuptools wheel packaging ninja
+          uv pip install --system --index-url https://download.pytorch.org/whl/cu130 torch==2.12.0+cu130
+          python - <<'PY'
+          import torch
+          print(torch.__version__, torch.version.cuda)
+          assert torch.__version__.startswith("2.12.0")
+          assert str(torch.version.cuda).startswith("13.0")
+          PY
+
+      - name: Fetch SageAttention source
+        run: |
+          set -euxo pipefail
+          git clone https://github.com/thu-ml/SageAttention.git SageAttention
+          cd SageAttention
+          git checkout d1a57a5
+          git rev-parse HEAD
+
+      - name: Apply Turing MMA patch
+        run: |
+          set -euxo pipefail
+          cp patch_sageattention_sm75.py SageAttention/
+          cd SageAttention
+          python patch_sageattention_sm75.py
+
+      - name: Build wheel
+        env:
+          TORCH_CUDA_ARCH_LIST: "7.5"
+          MAX_JOBS: "2"
+          EXT_PARALLEL: "2"
+          NVCC_APPEND_FLAGS: "--threads=2"
+          CUDA_HOME: /usr/local/cuda-13.0
+        run: |
+          set -euxo pipefail
+          cd SageAttention
+          python -m pip wheel . --no-build-isolation --no-deps -w dist
+          ls -lh dist
+
+      - name: Validate SM75 cubin
+        run: |
+          set -euxo pipefail
+          rm -rf wheelcheck && mkdir wheelcheck
+          python - <<'PY'
+          import glob, zipfile
+          whl = glob.glob("SageAttention/dist/*.whl")
+          assert len(whl) == 1, whl
+          with zipfile.ZipFile(whl[0]) as z:
+              so = [n for n in z.namelist() if n.endswith(".so")]
+              print("SO files:", so)
+              assert any("_qattn_sm80" in n for n in so), so
+              z.extractall("wheelcheck")
+          PY
+          SO=$(find wheelcheck -name '*_qattn_sm80*.so' | head -1)
+          /usr/local/cuda-13.0/bin/cuobjdump --list-elf "$SO" | tee cuobjdump.txt
+          grep -E 'sm_75|sm75' cuobjdump.txt
+
+      - name: Normalize artifact filename
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          d = Path("SageAttention/dist")
+          w = next(d.glob("*.whl"))
+          t = d / "sageattention-2.2.0+sm75.torch2.12cu130.turingmma1-cp312-cp312-linux_x86_64.whl"
+          if w != t:
+              w.rename(t)
+          print(t)
+          PY
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: sageattention-sm75-torch212-cu130-turingmma1
+          path: SageAttention/dist/*.whl
+          if-no-files-found: error
