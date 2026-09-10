@@ -48,8 +48,9 @@ jobs:
       - name: Apply Turing MMA patch
         run: |
           set -euxo pipefail
-          cp patch_sageattention_sm75.py SageAttention/
-          cd SageAttention
+          test -f "$GITHUB_WORKSPACE/patch_sageattention_sm75.py"
+          cp "$GITHUB_WORKSPACE/patch_sageattention_sm75.py" "$GITHUB_WORKSPACE/SageAttention/"
+          cd "$GITHUB_WORKSPACE/SageAttention"
           python patch_sageattention_sm75.py
 
       - name: Build wheel
